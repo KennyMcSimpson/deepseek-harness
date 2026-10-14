@@ -1,4 +1,4 @@
-import { once } from 'node:events'
+import { getEventListeners, once } from 'node:events'
 import { PassThrough, Writable } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import { JsonRpcLineTransport, JsonRpcResponseError } from '../src/index.ts'
@@ -9,6 +9,17 @@ function transportPair() {
   const a = new JsonRpcLineTransport(bToA, aToB)
   const b = new JsonRpcLineTransport(aToB, bToA)
   return { a, b, aToB, bToA }
+}
+
+async function destroyStreams(...streams: (PassThrough | Writable)[]): Promise<void> {
+  await Promise.all(streams.map(stream => new Promise<void>((resolve) => {
+    if (stream.closed) {
+      resolve()
+      return
+    }
+    stream.once('close', resolve)
+    stream.destroy()
+  })))
 }
 
 describe('JsonRpcLineTransport', () => {
@@ -247,6 +258,43 @@ describe('JsonRpcLineTransport', () => {
 
     await expect(pending).rejects.toThrow('input broke')
     b.close()
+  })
+
+  it.each(['write callback', 'destroy'] as const)('rejects pending and subsequent writes after an output %s error', async (mode) => {
+    const input = new PassThrough()
+    let failWrite: ((error?: Error | null) => void) | undefined
+    const output = new Writable({
+      write(_chunk, _encoding, callback) { failWrite = callback },
+    })
+    const transport = new JsonRpcLineTransport(input, output)
+    transport.start()
+    const failure = new Error('output failed while input remained open')
+    const emittedError = once(output, 'error')
+    const observed: unknown[] = []
+    const controller = new AbortController()
+    const pending = [transport.request('first', {}, controller.signal), transport.request('second', {})]
+      .map(request => request.then(
+        (value) => { observed.push(value) },
+        (error: unknown) => { observed.push(error) },
+      ))
+    try {
+      expect(failWrite).toBeDefined()
+      if (mode === 'destroy') output.destroy(failure)
+      else failWrite!(failure)
+      await emittedError
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+      await Promise.all(pending)
+
+      expect(observed).toEqual([failure, failure])
+      expect(input.destroyed).toBe(false)
+      await expect(transport.request('after-failure', {})).rejects.toBe(failure)
+      expect(() => { transport.notify('after-failure') }).toThrow(failure)
+    } finally {
+      transport.close()
+      await Promise.all(pending)
+      expect(output.listenerCount('error')).toBe(0)
+      await destroyStreams(input, output)
+    }
   })
 
   it('rejects pending requests when the transport closes', async () => {

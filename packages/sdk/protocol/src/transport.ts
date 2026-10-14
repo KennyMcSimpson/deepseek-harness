@@ -58,6 +58,8 @@ interface PendingRequest {
  * listeners; {@link close} detaches them and rejects pending requests without
  * destroying the streams. Missing request handlers return `-32601`; handler
  * failures return `-32603`. Notifications without a handler are dropped.
+ * Output errors reject pending requests; callers own stream disposal. An
+ * errored output rejects new requests and makes notifications throw its error.
  */
 export class JsonRpcLineTransport implements JsonRpcTransportPeer {
   private buffer = ''
@@ -72,13 +74,14 @@ export class JsonRpcLineTransport implements JsonRpcTransportPeer {
     private readonly output: Writable,
   ) {}
 
-  /** Attach the input listeners and begin reading frames. Idempotent. */
+  /** Attach stream listeners and begin reading frames. Idempotent. */
   start(): void {
     if (this.started) return
     this.started = true
     this.input.on('data', this.onData)
     this.input.on('error', this.onInputError)
     this.input.on('end', this.onInputEnd)
+    this.output.on('error', this.onOutputError)
   }
 
   /**
@@ -88,6 +91,7 @@ export class JsonRpcLineTransport implements JsonRpcTransportPeer {
     this.input.off('data', this.onData)
     this.input.off('error', this.onInputError)
     this.input.off('end', this.onInputEnd)
+    this.output.off('error', this.onOutputError)
     this.failPending(new Error('JSON-RPC transport closed'))
   }
 
@@ -146,6 +150,7 @@ export class JsonRpcLineTransport implements JsonRpcTransportPeer {
         },
       })
       try {
+        if (this.output.errored) throw this.output.errored
         this.write(message)
       } catch (error) {
         this.pending.delete(id)
@@ -156,6 +161,7 @@ export class JsonRpcLineTransport implements JsonRpcTransportPeer {
   }
 
   notify(method: string, params?: object): void {
+    if (this.output.errored) throw this.output.errored
     this.write(params === undefined ? { jsonrpc: '2.0', method } : { jsonrpc: '2.0', method, params })
   }
 
@@ -189,6 +195,10 @@ export class JsonRpcLineTransport implements JsonRpcTransportPeer {
   }
 
   private readonly onInputError = (error: Error): void => {
+    this.failPending(error)
+  }
+
+  private readonly onOutputError = (error: Error): void => {
     this.failPending(error)
   }
 
