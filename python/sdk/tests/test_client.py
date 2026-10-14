@@ -11,6 +11,60 @@ import pytest
 
 from deepseek_harness import DeepSeekHarness, HarnessClient, HarnessConfig, Notification, RunResult, SdkProtocolError
 from deepseek_harness.errors import JsonRpcError
+from deepseek_harness.models import InitializeResponse
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")], ids=["nan", "positive-infinity", "negative-infinity"])
+@pytest.mark.parametrize("operation", ["request", "notify", "respond", "respond_error"])
+def test_client_rejects_nonfinite_numbers_before_writing(tmp_path: Path, number: float, operation: str) -> None:
+    script = tmp_path / "strict_peer.py"
+    received = tmp_path / "received.jsonl"
+    script.write_text(
+        """
+import json
+import sys
+
+def reject_constant(value):
+    raise ValueError(value)
+
+with open(sys.argv[1], "w", encoding="utf-8") as received:
+    for line in sys.stdin:
+        received.write(line)
+        received.flush()
+        try:
+            message = json.loads(line, parse_constant=reject_constant)
+        except ValueError:
+            continue
+        if "id" in message and "method" in message:
+            result = {} if message["method"] == "shutdown" else {"serverInfo": {"name": "strict-peer"}}
+            print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+        if message.get("method") == "shutdown":
+            break
+""".strip(),
+        encoding="utf-8",
+    )
+    with HarnessClient(
+        HarnessConfig(request_timeout_seconds=1),
+        _launch_args=(sys.executable, str(script), str(received)),
+    ) as client:
+        client.initialize(provider="deepseek-official", cwd=str(tmp_path), model="fixture")
+        value = {"nested": [number]}
+        with pytest.raises(ValueError, match="Out of range float"):
+            if operation == "request":
+                client.request("invalid", value, response_model=InitializeResponse, on_notification=lambda _: None)
+            elif operation == "notify":
+                client.notify("invalid", value)
+            elif operation == "respond":
+                client.respond("invalid", value)
+            else:
+                client.respond_error("invalid", code=-32000, message="fixture", data=value)
+        assert client._responses == {}
+        assert client._notification_subscribers == {}
+        response = client.request("healthy", {"number": 1.25}, response_model=InitializeResponse)
+        assert response.serverInfo.name == "strict-peer"
+
+    frames = [json.loads(line) for line in received.read_text(encoding="utf-8").splitlines()]
+    assert [frame.get("method") for frame in frames] == ["initialize", "healthy", "shutdown"]
 
 
 def test_high_level_sdk_runs_turn_and_preserves_auto_review_errors(tmp_path: Path) -> None:

@@ -37,7 +37,11 @@ class HarnessConfig:
 
 
 class HarnessClient:
-    """Synchronous JSON-RPC client for the DeepSeek Harness SDK runtime over stdio."""
+    """Synchronous JSON-RPC client for the DeepSeek Harness SDK runtime over stdio.
+
+    request, notify, respond, and respond_error reject non-finite numbers with
+    ValueError before writing any bytes or closing the runtime.
+    """
 
     def __init__(
         self,
@@ -359,8 +363,8 @@ class HarnessClient:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise TransportClosedError("DeepSeek Harness runtime is not running")
+        payload = json.dumps(message, separators=(",", ":"), allow_nan=False) + "\n"
         try:
-            payload = json.dumps(message, separators=(",", ":")) + "\n"
             with self._write_lock:
                 proc.stdin.write(payload)
                 proc.stdin.flush()
